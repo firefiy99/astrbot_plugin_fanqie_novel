@@ -1,0 +1,71 @@
+{
+  "backend_mode": {
+    "description": "后端模式：auto=插件自动准备并管理下载器（推荐）；external=连接你已部署的后端",
+    "type": "string",
+    "options": [
+      "auto",
+      "external"
+    ],
+    "default": "auto"
+  },
+  "backend_url": {
+    "description": "外部后端地址（仅 external 模式生效）",
+    "type": "string",
+    "default": "http://127.0.0.1:18423"
+  },
+  "backend_password": {
+    "description": "外部后端密码（仅 external 模式生效）",
+    "type": "string",
+    "default": ""
+  },
+  "timeout_minutes": {
+    "description": "单本下载超时（分钟）",
+    "type": "int",
+    "default": 40
+  },
+  "poll_interval": {
+    "description": "进度轮询间隔（秒），建议 15~30",
+    "type": "int",
+    "default": 20
+  },
+  "max_queue": {
+    "description": "队列上限（本），超出拒绝，防止被刷成批量下载器",
+    "type": "int",
+    "default": 3
+  },
+  "auto_download": {
+    "description": "群里直接贴链接即开始下载（关闭则先预检需确认）",
+    "type": "bool",
+    "default": false
+  },
+  "progress_broadcast": {
+    "description": "关键节点进度播报（25%/50%/75%）",
+    "type": "bool",
+    "default": true
+  },
+  "cache_hours": {
+    "description": "结果缓存时长（小时），0 关闭",
+    "type": "int",
+    "default": 24
+  },
+  "admin_only": {
+    "description": "仅管理员可用",
+    "type": "bool",
+    "default": false
+  },
+  "admin_list": {
+    "description": "管理员 QQ 白名单（逗号或换行分隔）",
+    "type": "text",
+    "default": ""
+  },
+  "max_file_mb": {
+    "description": "单文件发送上限（MB）",
+    "type": "int",
+    "default": 80
+  },
+  "file_http_port": {
+    "description": "文件转发端口（NapCat 需能访问本机该端口）",
+    "type": "int",
+    "default": 18999
+  }
+}

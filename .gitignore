@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.part
+bin/
+backend/
+tests/_mockdata/
+.venv/
