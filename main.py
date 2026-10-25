@@ -44,6 +44,7 @@ HELP = (
     "\n/番茄 状态         查看当前任务"
     "\n/番茄 取消         取消排队任务"
     "\n/番茄 健康         检查后端状态"
+    "\n/番茄 清理         清理下载缓存"
     "\n也可以直接把番茄分享链接发到群里。"
 )
 
@@ -416,6 +417,15 @@ class FanqiePlugin(Star):
         if text in ("取消", "cancel"):
             yield event.plain_result(self._cancel())
             return
+        if text in ("清理", "清缓存", "清除缓存", "purge"):
+            yield event.plain_result(self._purge("all"))
+            return
+        if text in ("清理文件", "清文件"):
+            yield event.plain_result(self._purge("files"))
+            return
+        if text in ("清理内存", "清内存"):
+            yield event.plain_result(self._purge("mem"))
+            return
         if text in ("健康", "health", "ping"):
             yield event.plain_result(await self._health())
             return
@@ -462,6 +472,51 @@ class FanqiePlugin(Star):
         for j in q:
             j.state = "cancelled"
         return ("已取消 %d 个排队任务" % len(q)) if q else "当前没有可取消的任务"
+
+    def _purge(self, scope: str) -> str:
+        """清理缓存。scope: files=本地文件, mem=内存, all=全部, backend=后端缓存"""
+        mem_n = len(self._cache)
+        file_n = 0
+        size = 0
+        if scope in ("files", "all"):
+            try:
+                for p in DL_DIR.glob("*"):
+                    if p.is_file():
+                        size += p.stat().st_size
+                        p.unlink()
+                        file_n += 1
+            except Exception as e:
+                logger.warning("[%s] 清理文件失败: %s" % (PLUGIN_NAME, e))
+        if scope in ("mem", "all"):
+            self._cache.clear()
+            # 顺便清掉已结束的任务记录
+            for k in [k for k, v in self._jobs.items() if v.state in ("done", "failed", "cancelled")]:
+                self._jobs.pop(k, None)
+        be_n = 0
+        if scope in ("backend", "all"):
+            lib = DATA_DIR / "library"
+            if lib.exists():
+                import shutil
+                for d in lib.iterdir():
+                    try:
+                        if d.is_dir():
+                            shutil.rmtree(d, ignore_errors=True)
+                            be_n += 1
+                        elif d.is_file() and d.suffix.lower() in (".txt", ".epub", ".pdf"):
+                            d.unlink()
+                            be_n += 1
+                    except Exception as e:
+                        logger.warning("[%s] 清理后端缓存失败: %s" % (PLUGIN_NAME, e))
+        parts = []
+        if scope in ("files", "all"):
+            parts.append("文件 %d 个（%.1fMB）" % (file_n, size / 1048576))
+        if scope in ("mem", "all"):
+            parts.append("内存记录 %d 条" % mem_n)
+        if scope in ("backend", "all"):
+            parts.append("后端缓存 %d 项" % be_n)
+        if not parts:
+            return "没有可清理的内容"
+        return "已清理：" + "，".join(parts)
 
     async def _submit(self, event: AstrMessageEvent, text: str) -> str:
         bid, need = parse_book_id(text)
