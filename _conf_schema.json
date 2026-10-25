@@ -63,8 +63,13 @@
     "type": "int",
     "default": 80
   },
+  "file_url_base": {
+    "description": "文件回链地址（留空自动探测）。发文件不再另开端口，默认复用面板端口的 /api/file 令牌服务；如自动探测不准可手填，如 http://172.22.0.2:6185",
+    "type": "string",
+    "default": ""
+  },
   "file_http_port": {
-    "description": "文件转发端口（NapCat 需能访问本机该端口）",
+    "description": "兜底文件服务端口（仅当令牌服务不可用时才使用；NapCat 需能访问本机该端口）",
     "type": "int",
     "default": 18999
   }

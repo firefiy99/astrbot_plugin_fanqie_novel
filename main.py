@@ -44,6 +44,7 @@ HELP = (
     "\n/番茄 状态         查看当前任务"
     "\n/番茄 取消         取消排队任务"
     "\n/番茄 健康         检查后端状态"
+    "\n/番茄 回链         诊断文件回链是否可用"
     "\n/番茄 清理         清理下载缓存"
     "\n也可以直接把番茄分享链接发到群里。"
 )
@@ -86,6 +87,9 @@ class FanqiePlugin(Star):
         self._http_runner = None
         self._http_base = ""
         self._http_port = int(config.get("file_http_port", 18999) or 18999)
+        # 文件回链：优先复用 AstrBot 面板端口的令牌服务，不自开端口
+        self._file_base = ""
+        self._file_base_override = str(config.get("file_url_base", "") or "").strip()
 
         logger.info("[%s] 已加载，模式=%s" % (PLUGIN_NAME, self._mode))
 
@@ -144,12 +148,167 @@ class FanqiePlugin(Star):
         except Exception as e:
             logger.error("[%s] 发送失败: %s" % (PLUGIN_NAME, e))
 
-    async def _http_start(self) -> str:
-        """起一个只服务下载目录的 HTTP 服务，返回对 NapCat 可达的 URL 前缀。
+    # ---------- 文件回链（走 AstrBot 自带令牌服务，不再自开端口） ----------
 
-        NapCat 与 AstrBot 分属不同容器，看不到彼此文件系统，
-        因此发文件必须给 URL，不能给本地路径。
+    def _dashboard_port(self) -> int:
+        """AstrBot 面板端口（默认 6185）。发文件复用这个端口，不再另开端口。"""
+        try:
+            from astrbot.core import astrbot_config
+            port = int((astrbot_config.get("dashboard") or {}).get("port") or 6185)
+            return port if 0 < port < 65536 else 6185
+        except Exception:
+            return 6185
+
+    @staticmethod
+    def _route_gateway() -> str:
+        """读默认路由的网关地址（容器里就是宿主机网关）。"""
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 3 or parts[1] != "00000000":
+                        continue
+                    raw = int(parts[2], 16)
+                    ip = ".".join(str((raw >> s) & 0xFF) for s in (0, 8, 16, 24))
+                    if ip and not ip.startswith("0."):
+                        return ip
+        except Exception:
+            pass
+        return ""
+
+    def _detect_host(self) -> str:
+        """探测本机在容器/主机网络中的地址。"""
+        import socket
+        for probe in ("8.8.8.8", "172.22.0.1"):
+            try:
+                sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sk.connect((probe, 80))
+                ip = sk.getsockname()[0]
+                sk.close()
+                if ip and not ip.startswith("127."):
+                    return ip
+            except Exception:
+                pass
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        return "127.0.0.1"
+
+    def _file_base_candidates(self) -> list:
+        """候选回链基址，按「外部最可能可达」排序。
+
+        面板端口通常是唯一已映射到宿主机/放行的端口，所以优先网关
+        （端口已发布时从容器内也能连通），再退容器 IP、容器名、本机。
         """
+        out = []
+
+        def _add(u) -> None:
+            u = str(u or "").strip().rstrip("/")
+            if u and u not in out:
+                out.append(u)
+
+        _add(self._file_base_override)
+        try:
+            from astrbot.core import astrbot_config
+            _add(astrbot_config.get("callback_api_base", ""))
+        except Exception:
+            pass
+        port = self._dashboard_port()
+        gw = self._route_gateway()
+        if gw:
+            _add("http://%s:%d" % (gw, port))
+        ip = self._detect_host()
+        if ip and not ip.startswith("127."):
+            _add("http://%s:%d" % (ip, port))
+        _add("http://astrbot:%d" % port)
+        _add("http://127.0.0.1:%d" % port)
+        return out
+
+    async def _probe_base(self, base: str, path: str) -> bool:
+        """用一次性令牌探测该基址是否真能取到文件。
+
+        AstrBot 的令牌是一次性的，探测和正式发文件必须用不同令牌。
+        必须用异步 client：令牌服务就在本进程里，同步请求会把自己堵死。
+        """
+        import aiohttp
+        try:
+            from astrbot.core import file_token_service
+            token = await file_token_service.register_file(path, timeout=60)
+        except Exception as e:
+            logger.warning("[%s] 文件令牌服务不可用: %s" % (PLUGIN_NAME, e))
+            return False
+        url = "%s/api/file/%s" % (base.rstrip("/"), token)
+        try:
+            to = aiohttp.ClientTimeout(total=4)
+            async with aiohttp.ClientSession(timeout=to) as s:
+                async with s.get(url) as r:
+                    return r.status == 200
+        except Exception:
+            return False
+
+    async def _token_url(self, base: str, path: str) -> str:
+        try:
+            from astrbot.core import file_token_service
+            token = await file_token_service.register_file(path, timeout=1800)
+            return "%s/api/file/%s" % (base.rstrip("/"), token)
+        except Exception as e:
+            logger.warning("[%s] 注册文件令牌失败: %s" % (PLUGIN_NAME, e))
+            return ""
+
+    async def _file_url(self, path: str, name: str) -> str:
+        """把本地文件换成一个 NapCat 取得到的 URL。"""
+        if self._file_base:
+            url = await self._token_url(self._file_base, path)
+            if url:
+                return url
+        for base in self._file_base_candidates():
+            if await self._probe_base(base, path):
+                self._file_base = base
+                logger.info("[%s] 文件回链地址 %s" % (PLUGIN_NAME, base))
+                url = await self._token_url(base, path)
+                if url:
+                    return url
+        # 兜底：自带 HTTP 服务（需 NapCat 能直连本机这个端口）
+        base = await self._http_start()
+        logger.warning(
+            "[%s] 令牌回链不可用，退回自带文件服务 %s（若收不到文件，请配置 file_url_base）"
+            % (PLUGIN_NAME, base)
+        )
+        return base + "/f/" + quote(name)
+
+    async def _diag(self) -> str:
+        """诊断文件回链：真实进程内逐个候选做一次令牌探测。"""
+        probe = None
+        for pth in DL_DIR.glob("*.txt"):
+            probe = str(pth)
+            break
+        if not probe:
+            probe = str(DL_DIR / "_probe.txt")
+            try:
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("probe")
+            except Exception as e:
+                return "诊断失败：无法创建探测文件 %s" % e
+        lines = ["文件回链诊断（面板端口 %d）" % self._dashboard_port()]
+        if self._file_base_override:
+            lines.append("配置指定：%s" % self._file_base_override)
+        ok_any = False
+        for base in self._file_base_candidates():
+            good = await self._probe_base(base, probe)
+            ok_any = ok_any or good
+            lines.append("%s %s" % ("可用  " if good else "不可用", base))
+        if self._file_base:
+            lines.append("当前使用：%s" % self._file_base)
+        lines.append("结论：令牌回链%s" % (
+            "可用，不需要任何端口映射" if ok_any
+            else "全部不可用，将退回自带文件服务（需端口映射）"))
+        return "\n".join(lines)
+
+    async def _http_start(self) -> str:
+        """兜底的独立文件服务（仅在令牌服务不可用时使用）。"""
         if self._http_base:
             return self._http_base
         from aiohttp import web
@@ -172,31 +331,10 @@ class FanqiePlugin(Star):
         if not ok:
             raise RuntimeError("no free http port: %s" % last)
         self._http_runner = runner
-        # 容器内对 NapCat 用容器 IP；同机部署时容器名/IP 皆可
         host = self._detect_host()
         self._http_base = "http://%s:%d" % (host, self._http_port)
-        logger.info("[%s] 文件服务已启动 %s" % (PLUGIN_NAME, self._http_base))
+        logger.info("[%s] 兜底文件服务已启动 %s" % (PLUGIN_NAME, self._http_base))
         return self._http_base
-
-    def _detect_host(self) -> str:
-        """探测一个 NapCat 能访问到的本机地址。"""
-        import socket
-        try:
-            sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sk.connect(("172.22.0.1", 80))
-            ip = sk.getsockname()[0]
-            sk.close()
-            if ip and not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-            if ip and not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
-        return "127.0.0.1"
 
     async def _http_get(self, request):
         from aiohttp import web
@@ -213,8 +351,7 @@ class FanqiePlugin(Star):
             if mb > limit:
                 await self._say(umo, "文件 %.1fMB 超过 %dMB 上限，未发送。" % (mb, limit))
                 return False
-            base = await self._http_start()
-            url = base + "/f/" + quote(name)
+            url = await self._file_url(path, name)
             await self.context.send_message(umo, MessageChain(chain=[File(name=name, url=url)]))
             return True
         except Exception as e:
@@ -428,6 +565,9 @@ class FanqiePlugin(Star):
             return
         if text in ("健康", "health", "ping"):
             yield event.plain_result(await self._health())
+            return
+        if text in ("回链", "诊断", "diag"):
+            yield event.plain_result(await self._diag())
             return
         yield event.plain_result(await self._submit(event, text))
 

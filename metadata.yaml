@@ -3,6 +3,6 @@ display_name: 番茄小说下载助手
 desc: 发送番茄小说分享链接，自动抓取整本并导出 TXT 发回聊天。插件自带下载器后端，首次运行自动准备，无需手动安装任何依赖。
 short_desc: 番茄分享链接一键下载 TXT
 author: 小星萤
-version: 1.2.0
+version: 1.3.0
 repo: "https://github.com/firefiy99/astrbot_plugin_fanqie_novel"
 astrbot_version: ">=4.16,<5"
