@@ -17,6 +17,7 @@
 
 import asyncio
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -42,6 +43,7 @@ HELP = (
     "番茄小说下载助手"
     "\n/番茄 搜索 <关键词>  搜索书籍"
     "\n/番茄 下载 <序号>    下载搜索结果里的第 N 本"
+    "\n/番茄 下一页/上一页  翻页（也可 /番茄 第N页）"
     "\n/番茄 <分享链接>     下载整本为 TXT"
     "\n/番茄 状态           查看当前任务"
     "\n/番茄 取消         取消排队任务"
@@ -574,6 +576,18 @@ class FanqiePlugin(Star):
         if text.startswith("搜索"):
             yield event.plain_result(await self._search(event, text[2:].strip()))
             return
+        if text in ("下一页", "下页", "next"):
+            yield event.plain_result(self._turn_page(event.unified_msg_origin, delta=1))
+            return
+        if text in ("上一页", "上页", "prev"):
+            yield event.plain_result(self._turn_page(event.unified_msg_origin, delta=-1))
+            return
+        m = re.fullmatch(r"第\s*(\d+)\s*页", text)
+        if m:
+            yield event.plain_result(
+                self._turn_page(event.unified_msg_origin, page=int(m.group(1)))
+            )
+            return
         if text.startswith("search"):
             yield event.plain_result(await self._search(event, text[6:].strip()))
             return
@@ -704,6 +718,50 @@ class FanqiePlugin(Star):
             return head + "\n   " + " · ".join(meta)
         return head
 
+    def _page_size(self) -> int:
+        try:
+            n = int(self.config.get("search_page_size", 10) or 10)
+        except (TypeError, ValueError):
+            n = 10
+        return max(1, min(n, 20))
+
+    def _render_page(self, keyword, items, page, umo) -> str:
+        """渲染指定页；items 是完整结果列表。"""
+        size = self._page_size()
+        total = len(items)
+        pages = max(1, (total + size - 1) // size)
+        page = max(1, min(page, pages))
+        begin = (page - 1) * size
+        end = min(begin + size, total)
+        shown = items[begin:end]
+
+        head = "搜索「%s」共 %d 本 · 第 %d/%d 页" % (keyword, total, page, pages)
+        lines = [head, ""]
+        for i, it in enumerate(shown, 1):
+            lines.append(self._fmt_book(begin + i, it))
+        lines.append("")
+        tip = []
+        if pages > 1:
+            if page < pages:
+                tip.append("/番茄 下一页")
+            if page > 1:
+                tip.append("/番茄 上一页")
+            tip.append("/番茄 第N页")
+        tip.append("/番茄 下载 <序号>")
+        lines.append(" · ".join(tip))
+        lines.append("（序号是全局序号，可直接用于下载）")
+
+        ttl = int(self.config.get("search_cache_minutes", 10) or 0) * 60
+        self._search_hits[umo] = {
+            "expire": time.time() + max(60, ttl),
+            "items": list(items),
+            "keyword": keyword,
+            "page": page,
+        }
+        while len(self._search_hits) > 50:
+            self._search_hits.popitem(last=False)
+        return "\n".join(lines)
+
     async def _search(self, event, keyword):
         keyword = (keyword or "").strip()
         if not keyword:
@@ -734,36 +792,48 @@ class FanqiePlugin(Star):
             self._search_hits.pop(umo, None)
             return "没搜到「%s」相关的书。\n换个关键词试试，或用分享链接直接下载。" % keyword
 
-        limit = int(self.config.get("search_max_results", 10) or 10)
-        limit = max(1, min(limit, len(items)))
-        shown = items[:limit]
+        max_n = int(self.config.get("search_max_results", 20) or 20)
+        max_n = max(1, min(max_n, len(items)))
+        items = items[:max_n]
+        return self._render_page(keyword, items, 1, umo)
 
-        lines = ["搜索「%s」共 %d 本（显示前 %d 本）" % (keyword, len(items), limit), ""]
-        for i, it in enumerate(shown, 1):
-            lines.append(self._fmt_book(i, it))
-        lines.append("")
-        lines.append("下载请发送：/番茄 下载 <序号>，例如 /番茄 下载 1")
-
-        ttl = int(self.config.get("search_cache_minutes", 10) or 0) * 60
-        self._search_hits[umo] = (time.time() + max(60, ttl), list(shown))
-        while len(self._search_hits) > 50:
-            self._search_hits.popitem(last=False)
-
-        return "\n".join(lines)
+    def _turn_page(self, umo, delta=None, page=None):
+        """翻页。delta=±1 相对翻页；page 指定绝对页码。"""
+        hit = self._search_hits.get(umo)
+        if not hit:
+            return "没有可用的搜索结果，请先 /番茄 搜索 <关键词>"
+        if time.time() > hit["expire"]:
+            self._search_hits.pop(umo, None)
+            return "搜索结果已过期，请重新 /番茄 搜索 <关键词>"
+        items = hit["items"]
+        size = self._page_size()
+        pages = max(1, (len(items) + size - 1) // size)
+        cur = hit.get("page", 1)
+        if page is not None:
+            target = page
+            if target < 1 or target > pages:
+                return "页码超出范围，共 %d 页" % pages
+        else:
+            target = cur + (delta or 0)
+            if target < 1:
+                return "已经是第 1 页了"
+            if target > pages:
+                return "已经是最后一页了（共 %d 页）" % pages
+        return self._render_page(hit["keyword"], items, target, umo)
 
     async def _download_by_index(self, event, idx_text):
         umo = event.unified_msg_origin
         try:
             idx = int(str(idx_text).strip())
         except (TypeError, ValueError):
-            return "用法：/番茄 下载 <序号>，序号来自上一次搜索结果"
+            return "用法：/番茄 下载 <序号>，序号来自搜索结果"
         hit = self._search_hits.get(umo)
         if not hit:
             return "没有可用的搜索结果，请先 /番茄 搜索 <关键词>"
-        expire, items = hit
-        if time.time() > expire:
+        if time.time() > hit["expire"]:
             self._search_hits.pop(umo, None)
             return "搜索结果已过期，请重新 /番茄 搜索 <关键词>"
+        items = hit["items"]
         if idx < 1 or idx > len(items):
             return "序号超出范围，可选 1~%d" % len(items)
 

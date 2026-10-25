@@ -63,10 +63,15 @@
     "type": "int",
     "default": 80
   },
-  "search_max_results": {
-    "description": "搜索结果最多显示条数（后端一次返回 20 条）",
+  "search_page_size": {
+    "description": "每页显示条数（1~20，后端单次最多返回 20 条）",
     "type": "int",
     "default": 10
+  },
+  "search_max_results": {
+    "description": "搜索结果最多取多少条（后端单次上限 20；翻页也在这个范围内）",
+    "type": "int",
+    "default": 20
   },
   "search_cache_minutes": {
     "description": "搜索结果序号有效期（分钟），过期需重新搜索",
