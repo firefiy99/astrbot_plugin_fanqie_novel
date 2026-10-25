@@ -63,6 +63,21 @@
     "type": "int",
     "default": 80
   },
+  "search_max_results": {
+    "description": "搜索结果最多显示条数（后端一次返回 20 条）",
+    "type": "int",
+    "default": 10
+  },
+  "search_cache_minutes": {
+    "description": "搜索结果序号有效期（分钟），过期需重新搜索",
+    "type": "int",
+    "default": 10
+  },
+  "search_cooldown": {
+    "description": "同一会话搜索最小间隔（秒），防刷上游",
+    "type": "int",
+    "default": 5
+  },
   "file_url_base": {
     "description": "文件回链地址（留空自动探测）。发文件不再另开端口，默认复用面板端口的 /api/file 令牌服务；如自动探测不准可手填，如 http://172.22.0.2:6185",
     "type": "string",

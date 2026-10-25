@@ -40,8 +40,10 @@ DL_DIR = DATA_DIR / "downloads"
 
 HELP = (
     "番茄小说下载助手"
-    "\n/番茄 <分享链接>   下载整本为 TXT"
-    "\n/番茄 状态         查看当前任务"
+    "\n/番茄 搜索 <关键词>  搜索书籍"
+    "\n/番茄 下载 <序号>    下载搜索结果里的第 N 本"
+    "\n/番茄 <分享链接>     下载整本为 TXT"
+    "\n/番茄 状态           查看当前任务"
     "\n/番茄 取消         取消排队任务"
     "\n/番茄 健康         检查后端状态"
     "\n/番茄 回链         诊断文件回链是否可用"
@@ -90,6 +92,9 @@ class FanqiePlugin(Star):
         # 文件回链：优先复用 AstrBot 面板端口的令牌服务，不自开端口
         self._file_base = ""
         self._file_base_override = str(config.get("file_url_base", "") or "").strip()
+        self._search_hits: "OrderedDict[str, tuple]" = OrderedDict()
+        self._search_last: Dict[str, float] = {}
+        self._search_lock = asyncio.Lock()
 
         logger.info("[%s] 已加载，模式=%s" % (PLUGIN_NAME, self._mode))
 
@@ -566,6 +571,18 @@ class FanqiePlugin(Star):
         if text in ("健康", "health", "ping"):
             yield event.plain_result(await self._health())
             return
+        if text.startswith("搜索"):
+            yield event.plain_result(await self._search(event, text[2:].strip()))
+            return
+        if text.startswith("search"):
+            yield event.plain_result(await self._search(event, text[6:].strip()))
+            return
+        if text.startswith("下载"):
+            yield event.plain_result(await self._download_by_index(event, text[2:].strip()))
+            return
+        if text.startswith("dl"):
+            yield event.plain_result(await self._download_by_index(event, text[2:].strip()))
+            return
         if text in ("回链", "诊断", "diag"):
             yield event.plain_result(await self._diag())
             return
@@ -585,7 +602,9 @@ class FanqiePlugin(Star):
         # 同一条消息若同时命中了显式指令，交给指令处理，避免重复触发
         stripped = msg.strip()
         # 指令消息：框架会去掉斜杠，故同时判断中文/英文前缀
-        if stripped.startswith("番茄") or stripped.startswith("fanqie") or stripped.startswith("/") or stripped.startswith("／"):
+        if (stripped.startswith("番茄") or stripped.startswith("fanqie")
+                or stripped.startswith("/") or stripped.startswith("／")
+                or stripped.startswith("搜索") or stripped.startswith("下载")):
             return
         if not self.config.get("auto_download", False):
             bid, need = parse_book_id(url)
@@ -657,6 +676,106 @@ class FanqiePlugin(Star):
         if not parts:
             return "没有可清理的内容"
         return "已清理：" + "，".join(parts)
+
+    # ---------- 搜索 ----------
+
+    def _fmt_words(self, n) -> str:
+        try:
+            v = int(str(n))
+        except (TypeError, ValueError):
+            return ""
+        if v <= 0:
+            return ""
+        if v >= 10000:
+            return "%.1f万字" % (v / 10000.0)
+        return "%d字" % v
+
+    def _fmt_book(self, idx, item):
+        raw = item.get("raw") or {}
+        title = str(raw.get("book_name") or item.get("title") or "(无书名)").strip()
+        author = str(item.get("author") or raw.get("author") or "").strip()
+        cate = str(raw.get("category") or "").strip()
+        words = self._fmt_words(raw.get("word_number"))
+        status = str(raw.get("creation_status") or "").strip()
+        state = "完结" if status == "0" else "连载"
+        meta = [x for x in (author, cate, words, state) if x]
+        head = "%d. %s" % (idx, title)
+        if meta:
+            return head + "\n   " + " · ".join(meta)
+        return head
+
+    async def _search(self, event, keyword):
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return "用法：/番茄 搜索 <关键词>"
+        if not (self._ready and self._backend):
+            return "后端尚未就绪：" + (self._err or "首次运行正在准备，请稍后重试")
+
+        umo = event.unified_msg_origin
+        cool = float(self.config.get("search_cooldown", 5) or 0)
+        last = self._search_last.get(umo, 0.0)
+        if cool > 0 and time.time() - last < cool:
+            return "请稍等 %.0f 秒再搜索。" % (cool - (time.time() - last))
+        self._search_last[umo] = time.time()
+
+        await self._say(umo, "正在搜索「%s」…（约需几秒）" % keyword)
+
+        async with self._search_lock:
+            try:
+                items = await self._backend.search(keyword)
+            except BackendError as e:
+                logger.warning("[%s] 搜索失败: %s" % (PLUGIN_NAME, e))
+                return "搜索失败：%s" % e
+            except Exception as e:
+                logger.exception("[%s] 搜索异常" % PLUGIN_NAME)
+                return "搜索失败：%s" % e
+
+        if not items:
+            self._search_hits.pop(umo, None)
+            return "没搜到「%s」相关的书。\n换个关键词试试，或用分享链接直接下载。" % keyword
+
+        limit = int(self.config.get("search_max_results", 10) or 10)
+        limit = max(1, min(limit, len(items)))
+        shown = items[:limit]
+
+        lines = ["搜索「%s」共 %d 本（显示前 %d 本）" % (keyword, len(items), limit), ""]
+        for i, it in enumerate(shown, 1):
+            lines.append(self._fmt_book(i, it))
+        lines.append("")
+        lines.append("下载请发送：/番茄 下载 <序号>，例如 /番茄 下载 1")
+
+        ttl = int(self.config.get("search_cache_minutes", 10) or 0) * 60
+        self._search_hits[umo] = (time.time() + max(60, ttl), list(shown))
+        while len(self._search_hits) > 50:
+            self._search_hits.popitem(last=False)
+
+        return "\n".join(lines)
+
+    async def _download_by_index(self, event, idx_text):
+        umo = event.unified_msg_origin
+        try:
+            idx = int(str(idx_text).strip())
+        except (TypeError, ValueError):
+            return "用法：/番茄 下载 <序号>，序号来自上一次搜索结果"
+        hit = self._search_hits.get(umo)
+        if not hit:
+            return "没有可用的搜索结果，请先 /番茄 搜索 <关键词>"
+        expire, items = hit
+        if time.time() > expire:
+            self._search_hits.pop(umo, None)
+            return "搜索结果已过期，请重新 /番茄 搜索 <关键词>"
+        if idx < 1 or idx > len(items):
+            return "序号超出范围，可选 1~%d" % len(items)
+
+        item = items[idx - 1]
+        raw = item.get("raw") or {}
+        bid = str(item.get("book_id") or raw.get("book_id") or "").strip()
+        if not bid:
+            return "这条结果没有 book_id，无法下载。"
+        title = str(raw.get("book_name") or item.get("title") or "").strip()
+        if title:
+            await self._say(umo, "已选择第 %d 本：《%s》，开始下载…" % (idx, title))
+        return await self._submit(event, bid)
 
     async def _submit(self, event: AstrMessageEvent, text: str) -> str:
         bid, need = parse_book_id(text)

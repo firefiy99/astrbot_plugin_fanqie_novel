@@ -28,9 +28,9 @@ class FanqieBackend:
             h["x-tomato-password"] = self.password
         return h
 
-    async def _req(self, method: str, path: str, **kw) -> Any:
+    async def _req(self, method: str, path: str, timeout: int = None, **kw) -> Any:
         url = self.base_url + path
-        to = aiohttp.ClientTimeout(total=self.timeout)
+        to = aiohttp.ClientTimeout(total=timeout or self.timeout)
         try:
             async with aiohttp.ClientSession(timeout=to, headers=self.headers()) as s:
                 async with s.request(method, url, **kw) as r:
@@ -89,6 +89,23 @@ class FanqieBackend:
             for k in ("items", "books", "data"):
                 if isinstance(data.get(k), list):
                     return data[k]
+            return []
+        return data if isinstance(data, list) else []
+
+    async def search(self, keyword: str) -> List[Dict[str, Any]]:
+        """搜索书籍。后端 /api/search?q= 一次返回固定 20 条，无分页。"""
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            return []
+        data = await self._req(
+            "GET", "/api/search?q=" + quote(keyword, safe=""), timeout=45
+        )
+        if isinstance(data, dict):
+            for k in ("items", "books", "data"):
+                if isinstance(data.get(k), list):
+                    return data[k]
+            if data.get("error"):
+                raise BackendError(str(data["error"]))
             return []
         return data if isinstance(data, list) else []
 
